@@ -218,6 +218,118 @@ def main():
     except services.ValidationError as e:
         check(e.code == "bad_interval", f"倒挂区间被拦截: {e.code}")
 
+    print("[11] 同批新建后撤回/连续更换：临时编号按动作顺序生效，入库保留最终状态")
+    r = services.submit(conn, [
+        {"action": "add_layer", "code": "L5", "name": "同批测试层"},
+        {"action": "add_layer", "code": "L6", "name": "同批测试层2"},
+        {"action": "add_dating", "layer_id": -1,
+         "lower_year": 1000, "upper_year": 1100, "note": "L5 待撤回"},
+        {"action": "add_dating", "layer_id": -2,
+         "lower_year": 1200, "upper_year": 1300, "note": "L6 测年"},
+        {"action": "add_superposition",
+         "earlier_layer_id": -1, "later_layer_id": -2, "note": "L5 早于 L6"},
+        # 同批加入后又撤回：应入库为已撤回，且不参与编年
+        # 依据临时编号按动作顺序：-1 L5 测年、-2 L6 测年、-3 叠压、-4 误录测年
+        {"action": "add_dating", "layer_id": -1,
+         "lower_year": 1000, "upper_year": 1100, "note": "L5 误录"},
+        {"action": "withdraw_evidence", "evidence_id": -4},
+        # 登记：新增 -> 更换 -> 再更换（临时编号依次 -1、-2、-3）
+        {"action": "add_registration", "layer_id": -1,
+         "lower_year": 1000, "upper_year": 1300, "note": "初登"},
+        {"action": "replace_registration", "registration_id": -1,
+         "lower_year": 1010, "upper_year": 1250, "note": "第一次更换"},
+        {"action": "replace_registration", "registration_id": -2,
+         "lower_year": 1020, "upper_year": 1050, "note": "第二次更换"},
+    ])
+    check(r["accepted"], "同批新增/撤回/连续更换的批次通过")
+    state = services.full_state(conn)
+    ids5 = {x["code"]: x["id"] for x in state["layers"]}
+    evs = [e for e in state["evidence"] if e["note"].startswith("L5 误录")]
+    check(len(evs) == 1 and evs[0]["active"] is False,
+          f"同批新增后撤回的测年保留记录且为已撤回: {evs}")
+    check(not any(e["note"] == "L5 误录" for e in evs if e["active"]),
+          "撤回的测年不参与编年")
+    l5_regs = [x for x in state["registrations"]
+               if x["layer_id"] == ids5["L5"]]
+    by_note = {x["note"]: x for x in l5_regs}
+    check(by_note["初登"]["status"] == "replaced", "第一次登记状态 replaced")
+    check(by_note["第一次更换"]["status"] == "replaced", "第二次登记状态 replaced")
+    check(by_note["第二次更换"]["status"] == "active", "最后一次更换为 active")
+    check(by_note["初登"]["replaced_by"] == by_note["第一次更换"]["id"],
+          "更换链初登 -> 第一次更换 使用正式 id")
+    check(by_note["第一次更换"]["replaced_by"] == by_note["第二次更换"]["id"],
+          "更换链第一次更换 -> 第二次更换 使用正式 id")
+    iv5, _ = intervals_of(r["chronology"], "L5")
+    check(iv5 == [[1020, 1050]], f"编年只用最终有效登记收窄: {iv5}")
+    check(r["chronology"] == services.current_chronology(conn),
+          "受理回执编年与入库后查询一致")
+
+    print("[12] 已有叠压依据改指同批新增层位")
+    sup_id = [e for e in services.full_state(conn)["evidence"]
+              if e["kind"] == "superposition" and e["note"] == "L5 早于 L6"][0]["id"]
+    r = services.submit(conn, [
+        {"action": "add_layer", "code": "L7", "name": "新顶层"},
+        {"action": "add_dating", "layer_id": -1,
+         "lower_year": 1400, "upper_year": 1500, "note": "L7 测年"},
+        {"action": "correct_superposition", "evidence_id": sup_id,
+         "earlier_layer_id": ids5["L6"], "later_layer_id": -1,
+         "note": "改指 L6 早于新层 L7"},
+    ])
+    check(r["accepted"], "叠压依据改指同批新增层位通过（不再外键报错）")
+    state = services.full_state(conn)
+    ids7 = {x["code"]: x["id"] for x in state["layers"]}
+    sup = [e for e in state["evidence"] if e["id"] == sup_id][0]
+    check(sup["layer_id"] == ids5["L6"] and sup["layer2_id"] == ids7["L7"],
+          f"叠压关系落库为正式编号: {sup['layer_id']} -> {sup['layer2_id']}")
+    check(all(e["layer_id"] > 0 and (e["layer2_id"] or 0) >= 0 for e in state["evidence"]),
+          "依据台账无临时负 id")
+    check(all((x["replaced_by"] or 0) >= 0 for x in state["registrations"]),
+          "登记更换链无临时负 id")
+    iv7, _ = intervals_of(r["chronology"], "L7")
+    check(iv7 == [[1400, 1500]], f"新层编年正确: {iv7}")
+    check(r["chronology"] == services.current_chronology(conn),
+          "回执编年与入库后查询一致")
+
+    print("[13] 无解批次与写入失败均回滚，原编年表/依据/登记台账不变")
+    def ledger():
+        st = services.full_state(conn)
+        return (
+            services.current_chronology(conn),
+            [(e["id"], e["kind"], e["layer_id"], e["layer2_id"],
+              e["lower_year"], e["upper_year"], e["note"], e["active"])
+             for e in st["evidence"]],
+            [(x["id"], x["layer_id"], x["lower_year"], x["upper_year"],
+              x["note"], x["status"], x["replaced_by"]) for x in st["registrations"]],
+            [(l["id"], l["code"]) for l in st["layers"]],
+        )
+    before = ledger()
+    r = services.submit(conn, [
+        {"action": "add_layer", "code": "L8"},
+        {"action": "add_dating", "layer_id": -1, "lower_year": 10, "upper_year": 20},
+        {"action": "add_registration", "layer_id": -1,
+         "lower_year": 100, "upper_year": 200},
+    ])
+    check(not r["accepted"], "同批新增对象导致无解时整批驳回")
+    check(ledger() == before, "驳回后编年表与依据、登记台账均不变")
+
+    original_insert = dbmod.insert_layer
+    def boom(*args, **kwargs):
+        raise RuntimeError("模拟写库失败")
+    dbmod.insert_layer = boom
+    try:
+        services.submit(conn, [
+            {"action": "add_layer", "code": "L9"},
+            {"action": "add_dating", "layer_id": -1, "lower_year": 1, "upper_year": 2},
+        ])
+        raise AssertionError("应当抛出写入异常")
+    except RuntimeError as e:
+        check("写库失败" in str(e), "写入失败向上抛出")
+    finally:
+        dbmod.insert_layer = original_insert
+    check(ledger() == before, "写入失败回滚后台账与编年表不变")
+    r = services.submit(conn, [{"action": "add_layer", "code": "L10"}])
+    check(r["accepted"], "写入失败后连接仍可继续提交")
+
     print("\n全部服务层测试通过。")
 
 

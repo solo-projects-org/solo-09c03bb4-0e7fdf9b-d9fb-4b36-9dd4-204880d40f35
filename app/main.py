@@ -19,12 +19,13 @@ app = FastAPI(title="考古编年核对", version="1.0.0")
 
 _conn = None
 _conn_lock = threading.Lock()  # 单 sqlite 连接串行化，保证提交事务隔离
+_init_lock = threading.Lock()  # 仅保护连接初始化，避免与 _conn_lock 重入死锁
 
 
 def get_conn():
     global _conn
     if _conn is None:
-        with _conn_lock:
+        with _init_lock:
             if _conn is None:
                 _conn = dbmod.connect(DB_PATH)
                 dbmod.init_db(_conn)

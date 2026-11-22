@@ -82,6 +82,11 @@ class Snapshot:
     layer_rid: Dict[int, int] = field(default_factory=dict)
     evidence_rid: Dict[int, int] = field(default_factory=dict)
     reg_rid: Dict[int, int] = field(default_factory=dict)
+    # 本批新建对象（按动作顺序记录临时 id），落库时按最终快照内容写入。
+    # 不再把 _tmp_* 写回调用方的动作字典，避免遗留状态污染重复提交。
+    new_layers: List[int] = field(default_factory=list)
+    new_evidence: List[int] = field(default_factory=list)
+    new_registrations: List[int] = field(default_factory=list)
     tmp_layer_seq: int = 0
     tmp_evidence_seq: int = 0
     tmp_reg_seq: int = 0
@@ -203,7 +208,7 @@ def apply_action(snap: Snapshot, act: dict, index: int) -> None:
         tmp = snap.next_layer_tmp()
         snap.layers[tmp] = LayerRec(tmp, code, str(act.get("name", "")))
         snap.layer_rid[tmp] = tmp  # 临时键先指向自身，落库时再改写为真实 id
-        act["_tmp_layer"] = tmp
+        snap.new_layers.append(tmp)
         return
 
     if kind == "add_dating":
@@ -213,7 +218,7 @@ def apply_action(snap: Snapshot, act: dict, index: int) -> None:
         tmp = snap.next_evidence_tmp()
         snap.evidence[tmp] = EvidenceRec(tmp, "datum", lid, None, lo, hi, note)
         snap.evidence_rid[tmp] = tmp
-        act["_tmp_evidence"] = tmp
+        snap.new_evidence.append(tmp)
         return
 
     if kind == "add_superposition":
@@ -227,7 +232,7 @@ def apply_action(snap: Snapshot, act: dict, index: int) -> None:
             tmp, "superposition", earlier, later, None, None, note
         )
         snap.evidence_rid[tmp] = tmp
-        act["_tmp_evidence"] = tmp
+        snap.new_evidence.append(tmp)
         return
 
     if kind == "correct_dating":
@@ -269,7 +274,7 @@ def apply_action(snap: Snapshot, act: dict, index: int) -> None:
         tmp = snap.next_reg_tmp()
         snap.registrations[tmp] = RegistrationRec(tmp, lid, lo, hi, note)
         snap.reg_rid[tmp] = tmp
-        act["_tmp_reg"] = tmp
+        snap.new_registrations.append(tmp)
         return
 
     if kind == "replace_registration":
@@ -286,9 +291,9 @@ def apply_action(snap: Snapshot, act: dict, index: int) -> None:
             new_tmp, old.layer_id, lo, hi, note or old.note
         )
         snap.reg_rid[new_tmp] = new_tmp
+        snap.new_registrations.append(new_tmp)
         old.status = "replaced"
         old.replaced_by = new_tmp
-        act["_tmp_reg"] = new_tmp
         return
 
     if kind == "withdraw_registration":
@@ -340,55 +345,78 @@ def apply_action(snap: Snapshot, act: dict, index: int) -> None:
 # --------------------------------------------------------------------------- #
 # 落库
 # --------------------------------------------------------------------------- #
-def persist(conn: sqlite3.Connection, snap: Snapshot, actions: List[dict]) -> None:
-    """把快照相对当前库的变化写入。临时对象插入，被撤回/更换对象更新。"""
-    # 已存在层位的 id 即真实 id，先放入映射，临时层位插入后再补。
-    for lid, rec in snap.layers.items():
+def persist(conn: sqlite3.Connection, snap: Snapshot) -> None:
+    """把快照相对当前库的变化写入。
+
+    本批新建对象按动作顺序（临时编号顺序）插入；其内容和状态一律取快照中的
+    **最终值**（同批内可再更正/更换/撤回）。所有跨对象引用在写库前换成正式 id，
+    保证叠压关系与登记更换链落库后不再出现临时负 id。
+    """
+    # 已存在对象的 id 即真实 id；新建对象的映射在插入后补全。
+    for lid in snap.layers:
         if lid > 0:
             snap.layer_rid[lid] = lid
 
-    def real_layer(ref: int) -> int:
-        return snap.layer_rid.get(ref, ref)
+    def real_layer(ref: Optional[int]) -> Optional[int]:
+        return None if ref is None else snap.layer_rid.get(ref, ref)
 
-    # 1. 层位
-    for act in actions:
-        if act.get("action") == "add_layer":
-            tmp = act["_tmp_layer"]
-            rec = snap.layers[tmp]
-            real = dbmod.insert_layer(conn, rec.code, rec.name)
-            snap.layer_rid[tmp] = real
+    def real_reg(ref: Optional[int]) -> Optional[int]:
+        return None if ref is None else snap.reg_rid.get(ref, ref)
 
-    # 2. 依据
-    for act in actions:
-        tmp = act.get("_tmp_evidence")
-        if tmp is not None:
-            rec = snap.evidence[tmp]
-            lid = real_layer(rec.layer_id)
-            if rec.kind == "datum":
-                real = dbmod.insert_dating(conn, lid, rec.lower_year, rec.upper_year, rec.note)
-            else:
-                l2 = rec.layer2_id
-                if l2 is not None:
-                    l2 = real_layer(l2)
-                real = dbmod.insert_superposition(conn, lid, l2, rec.note)
-            snap.evidence_rid[tmp] = real
+    # 1. 层位（按动作顺序）
+    for tmp in snap.new_layers:
+        rec = snap.layers[tmp]
+        snap.layer_rid[tmp] = dbmod.insert_layer(conn, rec.code, rec.name)
 
-    # 3. 登记
-    for act in actions:
-        tmp = act.get("_tmp_reg")
-        if tmp is not None:
-            rec = snap.registrations[tmp]
-            lid = real_layer(rec.layer_id)
-            real = dbmod.insert_registration(conn, lid, rec.lower_year, rec.upper_year, rec.note)
-            snap.reg_rid[tmp] = real
+    # 2. 依据（按动作顺序，写入最终内容）
+    for tmp in snap.new_evidence:
+        rec = snap.evidence[tmp]
+        lid = real_layer(rec.layer_id)
+        if rec.kind == "datum":
+            real = dbmod.insert_dating(
+                conn, lid, rec.lower_year, rec.upper_year, rec.note
+            )
+        else:
+            real = dbmod.insert_superposition(
+                conn, lid, real_layer(rec.layer2_id), rec.note
+            )
+        snap.evidence_rid[tmp] = real
+        # 新建即被撤回的依据：落库为已撤回状态（保留记录与最终状态）
+        if not rec.active:
+            dbmod.deactivate_evidence(conn, real)
 
-    # 4. 对已存在对象的状态更新（撤回/更换/更正）
+    # 3. 登记（按动作顺序，写入最终内容）
+    for tmp in snap.new_registrations:
+        rec = snap.registrations[tmp]
+        snap.reg_rid[tmp] = dbmod.insert_registration(
+            conn, real_layer(rec.layer_id), rec.lower_year, rec.upper_year, rec.note
+        )
+
+    # 4. 登记状态与更换链（正式 id）
+    for tmp in snap.new_registrations:
+        rec = snap.registrations[tmp]
+        real = snap.reg_rid[tmp]
+        if rec.status != "active" or rec.replaced_by is not None:
+            dbmod.mark_registration(conn, real, rec.status, real_reg(rec.replaced_by))
+    for rid, rec in snap.registrations.items():
+        if rid < 0:
+            continue
+        row = dbmod.get_registration(conn, rid)
+        if row is None:
+            continue
+        replaced_real = real_reg(rec.replaced_by)
+        if row["status"] == rec.status and row["replaced_by"] == replaced_real:
+            continue
+        dbmod.mark_registration(conn, rid, rec.status, replaced_real)
+
+    # 5. 已存在依据的最终内容/状态（含被更正为指向本批新增层位的情形）
     for eid, rec in snap.evidence.items():
         if eid < 0:
             continue
         row = dbmod.get_evidence(conn, eid)
         if row is None:
             continue
+        lid, l2 = real_layer(rec.layer_id), real_layer(rec.layer2_id)
         if bool(row["active"]) != rec.active:
             if not rec.active:
                 dbmod.deactivate_evidence(conn, eid)
@@ -396,28 +424,17 @@ def persist(conn: sqlite3.Connection, snap: Snapshot, actions: List[dict]) -> No
                 conn.execute(
                     "UPDATE evidence SET active=1, withdrawn_at=NULL, "
                     "lower_year=?, upper_year=?, layer_id=?, layer2_id=?, note=? WHERE id=?",
-                    (rec.lower_year, rec.upper_year, rec.layer_id, rec.layer2_id, rec.note, eid),
+                    (rec.lower_year, rec.upper_year, lid, l2, rec.note, eid),
                 )
         elif (row["lower_year"], row["upper_year"], row["layer_id"],
               row["layer2_id"], row["note"]) != (
-            rec.lower_year, rec.upper_year, rec.layer_id, rec.layer2_id, rec.note
+            rec.lower_year, rec.upper_year, lid, l2, rec.note
         ):
             conn.execute(
                 "UPDATE evidence SET lower_year=?, upper_year=?, layer_id=?, "
                 "layer2_id=?, note=? WHERE id=?",
-                (rec.lower_year, rec.upper_year, rec.layer_id, rec.layer2_id, rec.note, eid),
+                (rec.lower_year, rec.upper_year, lid, l2, rec.note, eid),
             )
-
-    for rid, rec in snap.registrations.items():
-        if rid < 0:
-            continue
-        row = dbmod.get_registration(conn, rid)
-        if row is None or row["status"] == rec.status:
-            continue
-        replaced_real = None
-        if rec.replaced_by is not None and rec.replaced_by < 0:
-            replaced_real = snap.reg_rid.get(rec.replaced_by)
-        dbmod.mark_registration(conn, rid, rec.status, replaced_real)
 
 
 # --------------------------------------------------------------------------- #
@@ -471,6 +488,12 @@ def submit(conn: sqlite3.Connection, actions: List[dict]) -> dict:
     if not isinstance(actions, list) or not actions:
         raise ValidationError("empty_submission", "提交必须包含至少一个动作")
 
+    def rollback() -> None:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass  # 事务可能已结束（如写失败后由 sqlite 回滚），避免掩盖原始错误
+
     conn.execute("BEGIN IMMEDIATE")
     try:
         snap = load_snapshot(conn)
@@ -479,7 +502,7 @@ def submit(conn: sqlite3.Connection, actions: List[dict]) -> dict:
 
         result = build_and_solve(snap)
         if not result["satisfiable"]:
-            conn.execute("ROLLBACK")
+            rollback()
             decorated = _decorate_conflict(snap, result["conflict"])
             # 驳回同样写入流水（回滚后以新事务留痕，原编年表不变）。
             sub_id = dbmod.insert_submission(
@@ -494,12 +517,21 @@ def submit(conn: sqlite3.Connection, actions: List[dict]) -> dict:
                 "chronology": current_chronology(conn),
             }
 
-        persist(conn, snap, actions)
-        saved = build_and_solve(load_snapshot(conn))
+        persist(conn, snap)
+
+        # 入库存档后再从库中取“最终状态”组装编年表：受理回执、流水详情
+        # 与随后 GET /api/chronology 看到的必须是同一份结果。
+        final_snap = load_snapshot(conn)
+        saved = build_and_solve(final_snap)
+        if not saved["satisfiable"]:
+            # 防御：落库结果与事务内快照不一致时按写入失败处理，整批回滚。
+            raise RuntimeError("入库后的状态无法通过核对，已整批回滚")
+        chronology = _chronology_from_solution(final_snap, saved)
         detail = {
             "action_count": len(actions),
             "conflict": None,
             "domains": {str(k): v for k, v in saved["domains"].items()},
+            "chronology": chronology,
         }
         sub_id = dbmod.insert_submission(conn, True, "ok", detail)
         conn.execute("COMMIT")
@@ -507,13 +539,13 @@ def submit(conn: sqlite3.Connection, actions: List[dict]) -> dict:
             "accepted": True,
             "submission_id": sub_id,
             "reason": "ok",
-            "chronology": _chronology_from_solution(load_snapshot(conn), saved),
+            "chronology": chronology,
         }
     except ValidationError:
-        conn.execute("ROLLBACK")
+        rollback()
         raise
     except Exception:
-        conn.execute("ROLLBACK")
+        rollback()
         raise
 
 

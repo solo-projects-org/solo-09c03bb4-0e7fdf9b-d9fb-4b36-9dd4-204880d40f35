@@ -178,6 +178,84 @@ def main():
     check(any(s["accepted"] is False for s in subs), "流水中含驳回记录")
     check(any(s["accepted"] for s in subs), "流水中含通过记录")
 
+    print("[H8] 同批新增后撤回 + 登记连续更换两次")
+    code, r = call("POST", "/api/submissions", {"actions": [
+        {"action": "add_layer", "code": "H8A"},
+        {"action": "add_layer", "code": "H8B"},
+        {"action": "add_dating", "layer_id": -1,
+         "lower_year": 500, "upper_year": 600, "note": "待撤回测年"},
+        {"action": "add_dating", "layer_id": -2,
+         "lower_year": 700, "upper_year": 800, "note": "H8B 测年"},
+        {"action": "add_superposition",
+         "earlier_layer_id": -1, "later_layer_id": -2, "note": "H8A 早于 H8B"},
+        {"action": "add_dating", "layer_id": -1,
+         "lower_year": 500, "upper_year": 600, "note": "同批误录"},
+        {"action": "withdraw_evidence", "evidence_id": -4},
+        {"action": "add_registration", "layer_id": -1,
+         "lower_year": 450, "upper_year": 700, "note": "初登"},
+        {"action": "replace_registration", "registration_id": -1,
+         "lower_year": 460, "upper_year": 650, "note": "更换一"},
+        {"action": "replace_registration", "registration_id": -2,
+         "lower_year": 470, "upper_year": 550, "note": "更换二"},
+    ]}, expect=200)
+    check(r["accepted"], "同批撤回/连续更换提交通过")
+    state = call("GET", "/api/state")[1]
+    ids8 = {x["code"]: x["id"] for x in state["layers"]}
+    evs = [e for e in state["evidence"] if e["note"] == "同批误录"]
+    check(len(evs) == 1 and evs[0]["active"] is False,
+          "撤回的测年保留记录且为已撤回")
+    regs = {x["note"]: x for x in state["registrations"]
+            if x["layer_id"] == ids8["H8A"]}
+    check(regs["初登"]["status"] == "replaced"
+          and regs["更换一"]["status"] == "replaced"
+          and regs["更换二"]["status"] == "active",
+          f"登记状态: {[(k, v['status']) for k, v in regs.items()]}")
+    check(regs["初登"]["replaced_by"] == regs["更换一"]["id"]
+          and regs["更换一"]["replaced_by"] == regs["更换二"]["id"],
+          "更换链使用正式编号")
+    rows = {x["code"]: x for x in r["chronology"]["layers"]}
+    check(rows["H8A"]["feasible_intervals"] == [[500, 550]],
+          f"H8A 按最终登记收窄: {rows['H8A']['feasible_intervals']}")
+    check(r["chronology"] == call("GET", "/api/chronology")[1],
+          "受理回执编年与入库后查询一致")
+    sub = [s for s in call("GET", "/api/submissions")[1]
+           if s["id"] == r["submission_id"]][0]
+    check(sub["detail"]["chronology"] == r["chronology"],
+          "流水中记录的编年与回执一致")
+
+    print("[H9] 已有叠压依据改指同批新增层位")
+    sup_id = [e for e in call("GET", "/api/state")[1]["evidence"]
+              if e["kind"] == "superposition" and e["note"] == "H8A 早于 H8B"][0]["id"]
+    code, r = call("POST", "/api/submissions", {"actions": [
+        {"action": "add_layer", "code": "H9"},
+        {"action": "add_dating", "layer_id": -1,
+         "lower_year": 900, "upper_year": 1000, "note": "H9 测年"},
+        {"action": "correct_superposition", "evidence_id": sup_id,
+         "earlier_layer_id": ids8["H8B"], "later_layer_id": -1,
+         "note": "改指 H8B 早于 H9"},
+    ]}, expect=200)
+    check(r["accepted"], "改指同批新增层位通过")
+    state = call("GET", "/api/state")[1]
+    ids9 = {x["code"]: x["id"] for x in state["layers"]}
+    sup = [e for e in state["evidence"] if e["id"] == sup_id][0]
+    check(sup["layer_id"] == ids8["H8B"] and sup["layer2_id"] == ids9["H9"],
+          "叠压关系落库为正式编号")
+    check(all(e["layer_id"] > 0 for e in state["evidence"])
+          and all((x["replaced_by"] or 0) >= 0 for x in state["registrations"]),
+          "台账无临时负 id")
+
+    print("[H10] 无解批次回滚，原表不变")
+    before = call("GET", "/api/chronology")[1]
+    code, r = call("POST", "/api/submissions", {"actions": [
+        {"action": "add_layer", "code": "H10"},
+        {"action": "add_dating", "layer_id": -1, "lower_year": 1, "upper_year": 2},
+        {"action": "add_registration", "layer_id": -1,
+         "lower_year": 50, "upper_year": 60},
+    ]}, expect=409)
+    check(not r["accepted"], "同批新增对象导致无解时整批驳回")
+    check(call("GET", "/api/chronology")[1] == before, "驳回后编年表不变")
+    check(r["chronology"] == before, "驳回回执中的编年表即原表")
+
     print("\nHTTP 级自测全部通过。")
 
 

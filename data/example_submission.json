@@ -1,5 +1,5 @@
 {
-  "_说明": "示例提交：三个层位、分离候选区间（含空档）、严格早于、同批临时 id 引用。POST /api/submissions。临时 id 按建层顺序分配：T1=-1, T2=-2, T3=-3",
+  "_说明": "示例提交：三个层位、分离候选区间（含空档）、严格早于、同批临时 id 引用，以及同批内“新增后撤回”和“登记连续更换两次”。POST /api/submissions。临时编号按动作顺序从 -1 起分配，层位/依据/登记各自独立计数。",
   "actions": [
     {"action": "add_layer", "code": "T1", "name": "探方A第1层"},
     {"action": "add_layer", "code": "T2", "name": "探方A第2层"},
@@ -13,6 +13,15 @@
     {"action": "add_superposition", "earlier_layer_id": -1, "later_layer_id": -2, "note": "T2 叠压 T1"},
     {"action": "add_superposition", "earlier_layer_id": -2, "later_layer_id": -3, "note": "T3 叠压 T2"},
 
-    {"action": "add_registration", "layer_id": -1, "lower_year": -1300, "upper_year": -1000, "note": "拟采用早段（可后续更换/撤回）"}
+    {"action": "add_dating", "layer_id": -1, "lower_year": -880, "upper_year": -860,
+     "note": "R1 补测（同批误录，随后撤回；本批第 7 条依据 = -7）"},
+    {"action": "withdraw_evidence", "evidence_id": -7},
+
+    {"action": "add_registration", "layer_id": -1, "lower_year": -1300, "upper_year": -1000, "note": "T1 拟采用早段"},
+    {"action": "add_registration", "layer_id": -2, "lower_year": -1000, "upper_year": -960, "note": "T2 拟采用（初登）"},
+    {"action": "replace_registration", "registration_id": -2,
+     "lower_year": -1000, "upper_year": -950, "note": "T2 第一次更换"},
+    {"action": "replace_registration", "registration_id": -3,
+     "lower_year": -1000, "upper_year": -945, "note": "T2 第二次更换"}
   ]
 }

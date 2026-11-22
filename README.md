@@ -25,11 +25,14 @@ SQLite 数据库持久化在宿主机 `./data/chrono.db`（compose 已挂载卷�
 
 ```bash
 python3 -I tests/test_solver.py     # 求解器：4000 组随机实例 vs 暴力枚举 + 定向用例
-python3 -I tests/test_services.py  # 服务层：事务、登记/更正交错、冲突回滚
+python3 -I tests/test_services.py  # 服务层：事务、登记/更正交错、同批撤回/连续更换、冲突回滚
 CHRONO_DB_PATH=/tmp/t.db PORT=8000 python3 -I tests/stdlib_server.py &
 python3 -I tests/test_http.py      # HTTP 级：与前端相同的 API 契约
 bash tests/run_all.sh
 ```
+
+有依赖时也可直接对 FastAPI 版本跑同一套 HTTP 自测：
+`uvicorn app.main:app --port 8000` 后 `BASE_URL=http://127.0.0.1:8000 python3 -I tests/test_http.py`。
 
 ## 数据模型与 API
 
@@ -51,6 +54,13 @@ bash tests/run_all.sh
 
 ### 动作类型（提交体 `{"actions": [...]}`，同批可用负 id 引用本批新建对象，从 `-1` 起）
 
+临时编号按**动作顺序**分配，层位、依据、登记各自独立计数（第 1 个新建层位 = `-1`，
+第 1 条新建依据 = `-1`，第 1 条新建登记 = `-1`）。同一批内可以新增后再撤回/更正/
+更换同一个临时对象；这些动作按顺序作用在同一份快照上，整批以**批次结束时的状态**
+核对编年。入库时按动作顺序插入新对象，写入其最终内容与状态：被撤回的新增依据仍保留
+记录但为“已撤回”，被连续更换的登记保留完整替换链，叠压关系与 `replaced_by` 一律
+落正式编号。
+
 | action | 关键字段 |
 |---|---|
 | `add_layer` | `code`, `name?` |
@@ -66,6 +76,14 @@ bash tests/run_all.sh
 
 `withdraw_with` 用于“更正测年/叠压记录时一并撤回失效登记”：更正与撤回在同一事务内
 整体核对；若不撤回登记会导致无解，单独的更正提交将被驳回（测试 [H5]/[7] 覆盖正反两例）。
+
+### 提交结果的一致性
+
+- 通过时先落库，再从库中重新读取“最终状态”装配编年表；**受理回执**、**流水详情里的
+  `chronology`** 与随后 `GET /api/chronology` 返回的是同一份结果。
+- 批次无解 → 整批 `ROLLBACK`，仅写一条驳回流水；写入过程抛出异常（如约束/磁盘错误）
+  → 同样整批 `ROLLBACK`。两种情况下原编年表与依据、登记台账都保持提交前的状态。
+- 驳回（HTTP 409）回执中的 `chronology` 即当前仍可查的原编年表。
 
 ## 求解方法
 
